@@ -611,6 +611,11 @@ def _sse_event(event: str, data: Any) -> bytes:
     return f"event: {event}\ndata: {payload}\n\n".encode("utf-8")
 
 
+def _sse_comment(text: str) -> bytes:
+    # SSE comment line (keeps connection alive through proxies)
+    return f": {text}\n\n".encode("utf-8")
+
+
 @app.get("/api/stream")
 async def stream(iiif_url: HttpUrl, request: Request) -> StreamingResponse:
     """
@@ -622,8 +627,9 @@ async def stream(iiif_url: HttpUrl, request: Request) -> StreamingResponse:
     """
 
     async def gen():
-        # Keep-alive comment to encourage proxies to start streaming
-        yield b": connected\n\n"
+        # Keep-alive + retry hint to encourage proxies/browsers to keep streaming
+        yield b"retry: 3000\n"
+        yield _sse_comment("connected")
 
         try:
             manifest = await _fetch_json(str(iiif_url))
@@ -706,21 +712,31 @@ async def stream(iiif_url: HttpUrl, request: Request) -> StreamingResponse:
         results: List[Optional[PageResult]] = [None] * len(tasks)
 
         try:
-            for fut in asyncio.as_completed(tasks):
+            pending = set(tasks)
+            # Emit a keepalive at least this often while work is in progress
+            keepalive_s = 15.0
+            while pending:
                 if await request.is_disconnected():
                     for t in tasks:
                         t.cancel()
                     return
-                try:
-                    res: PageResult = await fut
-                    results[res.page_number - 1] = res
-                    completed += 1
-                    # Stage 1: stream transcript as soon as each page is done
-                    yield _sse_event("page", res.model_dump())
-                except asyncio.CancelledError:
-                    return
-                except Exception as e:
-                    yield _sse_event("page_error", {"error": str(e)})
+
+                done, pending = await asyncio.wait(pending, timeout=keepalive_s, return_when=asyncio.FIRST_COMPLETED)
+                if not done:
+                    yield _sse_comment("ping")
+                    continue
+
+                for fut in done:
+                    try:
+                        res: PageResult = await fut
+                        results[res.page_number - 1] = res
+                        completed += 1
+                        # Stage 1: stream transcript (and enhanced/original urls) as soon as each page is done
+                        yield _sse_event("page", res.model_dump())
+                    except asyncio.CancelledError:
+                        return
+                    except Exception as e:
+                        yield _sse_event("page_error", {"error": str(e)})
         finally:
             for t in tasks:
                 if not t.done():
@@ -780,7 +796,8 @@ async def stream(iiif_url: HttpUrl, request: Request) -> StreamingResponse:
         gen(),
         media_type="text/event-stream",
         headers={
-            "Cache-Control": "no-cache",
+            "Cache-Control": "no-cache, no-transform",
+            # Note: Connection header is ignored under HTTP/2/3, but harmless under HTTP/1.1.
             "Connection": "keep-alive",
             "X-Accel-Buffering": "no",
         },
