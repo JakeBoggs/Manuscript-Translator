@@ -31,8 +31,8 @@ OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 REQUEST_TIMEOUT_S = 240.0
 MAX_CONCURRENCY = 20
 
-TRANSCRIBE_MODEL = "google/gemini-3-pro-preview"
-TRANSLATE_MODEL = "google/gemini-3-pro-preview"
+TRANSCRIBE_MODEL = "google/gemini-3-flash-preview"
+TRANSLATE_MODEL = "openai/gpt-5.2"
 CROP_MODEL = "google/gemini-3-flash-preview"
 
 # In-memory cache for cropped images (job-scoped).
@@ -431,6 +431,7 @@ def _translate_batch_messages(tagged_transcripts: str, total_pages: int) -> List
     system = (
         "Task: Translate each page transcript to English.\n"
         "Input is a set of XML-like blocks: <page_1>...</page_1>, <page_2>...</page_2>, etc.\n"
+        "Any input text inside brackets is uncertain or inferred. Take this into consideration when translating.\n"
         "Output MUST contain translations for EVERY page in the SAME format: <page_1>...</page_1> ...\n"
         "Inside each <page_N> tag, use Markdown to format based on the author's intent (rather than matching OCR line for line).\n"
         "Do not include any other text outside the <page_N> tags.\n"
@@ -532,8 +533,6 @@ async def _translate_batch_stream(
     stream = await client.chat.completions.create(
         model=TRANSLATE_MODEL,
         messages=_translate_batch_messages(tagged_transcripts, total_pages),
-        temperature=1.0,
-        extra_body={"reasoning": {"effort": "high"}},
         stream=True,
     )
 
@@ -677,8 +676,9 @@ async def stream(iiif_url: HttpUrl, request: Request) -> StreamingResponse:
         semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
         completed = 0
 
-        async def run_transcribe(i: int, label: str, image_url: str) -> PageResult:
-            # Preprocess: crop to main body text (ignoring minor margins), then transcribe cropped image.
+        async def run_preprocess(i: int, label: str, image_url: str) -> Dict[str, Any]:
+            # Preprocess ASAP: crop to main body text (ignoring minor margins), enhance, cache both,
+            # and return endpoints + a data URL for the model.
             raw_bytes, raw_media = await _fetch_image_bytes(image_url)
             raw_data_url = _to_data_url(raw_bytes, raw_media)
 
@@ -690,34 +690,101 @@ async def stream(iiif_url: HttpUrl, request: Request) -> StreamingResponse:
                 # If crop detection fails, fall back to full image.
                 cropped_bytes = raw_bytes
 
-            # Cache original + enhanced (CLAHE on cropped)
+            # Cache original + enhanced
             _cache_original(job_id, i + 1, raw_bytes, raw_media)
             enhanced_bytes = _apply_clahe_lab_l(cropped_bytes)
             _cache_cropped(job_id, i + 1, enhanced_bytes, "image/jpeg")
-            cropped_data_url = _to_data_url(enhanced_bytes, "image/jpeg")
+            enhanced_data_url = _to_data_url(enhanced_bytes, "image/jpeg")
 
-            transcript_md, raw = await _transcribe_one(client, image_url=cropped_data_url, semaphore=semaphore)
+            enhanced_endpoint = f"/api/crop/{job_id}/{i+1}"
+            original_endpoint = f"/api/original/{job_id}/{i+1}"
+            return {
+                "page_number": i + 1,
+                "label": label or f"Page {i+1}",
+                "enhanced_data_url": enhanced_data_url,  # for model
+                "image_url": enhanced_endpoint,  # for frontend (default enhanced)
+                "enhanced_image_url": enhanced_endpoint,
+                "original_image_url": original_endpoint,
+            }
+
+        async def run_transcribe(pre: Dict[str, Any]) -> PageResult:
+            transcript_md, raw = await _transcribe_one(
+                client, image_url=str(pre["enhanced_data_url"]), semaphore=semaphore
+            )
             return PageResult(
-                page_number=i + 1,
-                label=label or f"Page {i+1}",
-                image_url=f"/api/crop/{job_id}/{i+1}",
-                original_image_url=f"/api/original/{job_id}/{i+1}",
-                enhanced_image_url=f"/api/crop/{job_id}/{i+1}",
+                page_number=int(pre["page_number"]),
+                label=str(pre["label"]),
+                image_url=str(pre["image_url"]),
+                original_image_url=str(pre["original_image_url"]),
+                enhanced_image_url=str(pre["enhanced_image_url"]),
                 transcript_md=transcript_md,
                 translation_md="",
                 raw_model_output=raw,
             )
 
-        tasks = [asyncio.create_task(run_transcribe(i, label, img)) for i, (label, img) in enumerate(pages)]
-        results: List[Optional[PageResult]] = [None] * len(tasks)
+        # Stage 1A: preprocess/enhance and emit image urls ASAP (so UI can switch to Enhanced immediately).
+        pre_tasks = [asyncio.create_task(run_preprocess(i, label, img)) for i, (label, img) in enumerate(pages)]
+        pre_by_page: List[Optional[Dict[str, Any]]] = [None] * len(pre_tasks)
 
         try:
-            pending = set(tasks)
-            # Emit a keepalive at least this often while work is in progress
+            pending = set(pre_tasks)
             keepalive_s = 15.0
             while pending:
                 if await request.is_disconnected():
-                    for t in tasks:
+                    for t in pre_tasks:
+                        t.cancel()
+                    return
+
+                done, pending = await asyncio.wait(pending, timeout=keepalive_s, return_when=asyncio.FIRST_COMPLETED)
+                if not done:
+                    yield _sse_comment("ping")
+                    continue
+
+                for fut in done:
+                    try:
+                        pre: Dict[str, Any] = await fut
+                        pre_by_page[int(pre["page_number"]) - 1] = pre
+                        # Emit image-ready update immediately (Enhanced/Original endpoints).
+                        yield _sse_event(
+                            "page",
+                            {
+                                "page_number": int(pre["page_number"]),
+                                "label": str(pre["label"]),
+                                "image_url": str(pre["image_url"]),
+                                "enhanced_image_url": str(pre["enhanced_image_url"]),
+                                "original_image_url": str(pre["original_image_url"]),
+                            },
+                        )
+                    except asyncio.CancelledError:
+                        return
+                    except Exception as e:
+                        yield _sse_event("page_error", {"error": str(e)})
+        finally:
+            for t in pre_tasks:
+                if not t.done():
+                    t.cancel()
+
+        # Stage 1B: transcribe using enhanced image data URLs
+        if await request.is_disconnected():
+            return
+
+        if any(p is None for p in pre_by_page):
+            yield _sse_event(
+                "error",
+                {"detail": "One or more pages failed preprocessing; skipping transcription/translation."},
+            )
+            yield _sse_event("done", {"total_pages": len(pages), "completed": completed})
+            return
+
+        trans_tasks = [asyncio.create_task(run_transcribe(pre_by_page[i])) for i in range(len(pre_by_page))]  # type: ignore[arg-type]
+        results: List[Optional[PageResult]] = [None] * len(trans_tasks)
+
+        try:
+            pending = set(trans_tasks)
+            keepalive_s = 15.0
+            while pending:
+                if await request.is_disconnected():
+                    for t in trans_tasks:
                         t.cancel()
                     return
 
@@ -731,14 +798,14 @@ async def stream(iiif_url: HttpUrl, request: Request) -> StreamingResponse:
                         res: PageResult = await fut
                         results[res.page_number - 1] = res
                         completed += 1
-                        # Stage 1: stream transcript (and enhanced/original urls) as soon as each page is done
+                        # Emit transcript update (no translation yet).
                         yield _sse_event("page", res.model_dump())
                     except asyncio.CancelledError:
                         return
                     except Exception as e:
                         yield _sse_event("page_error", {"error": str(e)})
         finally:
-            for t in tasks:
+            for t in trans_tasks:
                 if not t.done():
                     t.cancel()
 
