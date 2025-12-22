@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Manuscript Translator</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.7/dist/purify.min.js"></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-title">Manuscript Translator</div>
+      </div>
+      <div class="controls">
+        <div class="toggle" role="group" aria-label="View mode">
+          <button id="mode-translation" class="toggle-btn is-active" type="button">Translation</button>
+          <button id="mode-transcript" class="toggle-btn" type="button">Transcript</button>
+        </div>
+      </div>
+    </header>
+
+    <main class="container">
+      <section class="card">
+        <form id="iiif-form" class="form">
+          <label class="label" for="iiif-url">IIIF manifest URL</label>
+          <div class="row">
+            <input
+              id="iiif-url"
+              class="input"
+              type="url"
+              required
+              placeholder="https://.../manifest"
+              autocomplete="off"
+              spellcheck="false"
+            />
+            <button id="submit-btn" class="btn" type="submit">Process</button>
+          </div>
+        </form>
+        <div id="status" class="status" aria-live="polite"></div>
+      </section>
+
+      <section id="results" class="results"></section>
+    </main>
+
+    <template id="page-template">
+      <article class="page">
+        <div class="page-left">
+          <div class="page-meta">
+            <div class="page-title"></div>
+            <div class="page-subtitle"></div>
+          </div>
+          <div class="img-wrap">
+            <img class="page-img" alt="" loading="lazy" />
+          </div>
+        </div>
+        <div class="page-right">
+          <div class="content">
+            <div class="content-inner"></div>
+          </div>
+        </div>
+      </article>
+    </template>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>
+
+
