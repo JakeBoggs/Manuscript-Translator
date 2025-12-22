@@ -6,6 +6,7 @@ import uuid
 import os
 import re
 import json
+import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -24,6 +25,8 @@ import numpy as np
 
 
 load_dotenv()
+
+logger = logging.getLogger("manuscript_translator")
 
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 FASTAPI_APP_TITLE = "Manuscript Translator"
@@ -786,7 +789,10 @@ async def stream(iiif_url: HttpUrl, request: Request) -> StreamingResponse:
             )
 
         # Stage 1A: preprocess/enhance and emit image urls ASAP (so UI can switch to Enhanced immediately).
-        pre_tasks = [asyncio.create_task(run_preprocess(i, label, img)) for i, (label, img) in enumerate(pages)]
+        pre_tasks = []
+        for i, (label, img) in enumerate(pages):
+            t = asyncio.create_task(run_preprocess(i, label, img), name=f"preprocess:{i+1}")
+            pre_tasks.append(t)
         pre_by_page: List[Optional[Dict[str, Any]]] = [None] * len(pre_tasks)
 
         try:
@@ -821,7 +827,16 @@ async def stream(iiif_url: HttpUrl, request: Request) -> StreamingResponse:
                     except asyncio.CancelledError:
                         return
                     except Exception as e:
-                        yield _sse_event("page_error", {"error": str(e)})
+                        task_name = getattr(fut, "get_name", lambda: "preprocess:?")()
+                        logger.exception("page preprocess failed (%s): %s", task_name, e)
+                        yield _sse_event(
+                            "page_error",
+                            {
+                                "stage": "preprocess",
+                                "task": task_name,
+                                "error": str(e),
+                            },
+                        )
         finally:
             for t in pre_tasks:
                 if not t.done():
@@ -839,7 +854,12 @@ async def stream(iiif_url: HttpUrl, request: Request) -> StreamingResponse:
             yield _sse_event("done", {"total_pages": len(pages), "completed": completed})
             return
 
-        trans_tasks = [asyncio.create_task(run_transcribe(pre_by_page[i])) for i in range(len(pre_by_page))]  # type: ignore[arg-type]
+        trans_tasks = []
+        for i in range(len(pre_by_page)):
+            pre = pre_by_page[i]  # type: ignore[assignment]
+            page_no = int(pre["page_number"]) if isinstance(pre, dict) and "page_number" in pre else (i + 1)
+            t = asyncio.create_task(run_transcribe(pre), name=f"transcribe:{page_no}")  # type: ignore[arg-type]
+            trans_tasks.append(t)
         results: List[Optional[PageResult]] = [None] * len(trans_tasks)
 
         try:
@@ -866,7 +886,39 @@ async def stream(iiif_url: HttpUrl, request: Request) -> StreamingResponse:
                     except asyncio.CancelledError:
                         return
                     except Exception as e:
-                        yield _sse_event("page_error", {"error": str(e)})
+                        task_name = getattr(fut, "get_name", lambda: "transcribe:?")()
+                        logger.exception("page transcription failed (%s): %s", task_name, e)
+                        # Fill placeholder transcript and keep going so translation can still run.
+                        page_no = None
+                        try:
+                            if ":" in task_name:
+                                page_no = int(task_name.split(":", 1)[1])
+                        except Exception:
+                            page_no = None
+
+                        if page_no is not None and 1 <= page_no <= len(pre_by_page):
+                            pre = pre_by_page[page_no - 1] or {}
+                            placeholder = PageResult(
+                                page_number=page_no,
+                                label=str(pre.get("label") or f"Page {page_no}"),
+                                image_url=str(pre.get("image_url") or ""),
+                                original_image_url=str(pre.get("original_image_url") or ""),
+                                enhanced_image_url=str(pre.get("enhanced_image_url") or ""),
+                                transcript_md="transcript failed",
+                                translation_md="",
+                                raw_model_output=str(e),
+                            )
+                            results[page_no - 1] = placeholder
+                            completed += 1
+                            yield _sse_event("page", placeholder.model_dump())
+                        yield _sse_event(
+                            "page_error",
+                            {
+                                "stage": "transcribe",
+                                "task": task_name,
+                                "error": str(e),
+                            },
+                        )
         finally:
             for t in trans_tasks:
                 if not t.done():
@@ -876,14 +928,24 @@ async def stream(iiif_url: HttpUrl, request: Request) -> StreamingResponse:
         if await request.is_disconnected():
             return
 
-        transcripts = [r for r in results if r is not None]
-        if len(transcripts) != len(pages):
-            yield _sse_event(
-                "error",
-                {"detail": f"Only transcribed {len(transcripts)}/{len(pages)} pages; skipping batch translation."},
+        # Ensure every page has a transcript (placeholders for failures) so translation can still run.
+        for i in range(len(pre_by_page)):
+            if results[i] is not None:
+                continue
+            pre = pre_by_page[i] or {}
+            page_no = i + 1
+            results[i] = PageResult(
+                page_number=page_no,
+                label=str(pre.get("label") or f"Page {page_no}"),
+                image_url=str(pre.get("image_url") or ""),
+                original_image_url=str(pre.get("original_image_url") or ""),
+                enhanced_image_url=str(pre.get("enhanced_image_url") or ""),
+                transcript_md="transcript failed",
+                translation_md="",
+                raw_model_output="transcript failed",
             )
-            yield _sse_event("done", {"total_pages": len(pages), "completed": completed})
-            return
+
+        transcripts = [r for r in results if r is not None]
 
         tagged = "\n\n".join(
             f"<page_{p.page_number}>\n{p.transcript_md}\n</page_{p.page_number}>"

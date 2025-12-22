@@ -421,7 +421,8 @@ els.form.addEventListener("submit", async (e) => {
     evtSource.addEventListener("page_error", (ev) => {
       // Keep going; just surface the error.
       const data = JSON.parse(ev.data);
-      setStatus(`A page failed: ${data.error || "unknown error"}`, "error");
+      const where = data.stage ? ` (${data.stage}${data.task ? ` ${data.task}` : ""})` : "";
+      setStatus(`A page failed${where}: ${data.error || "unknown error"}`, "error");
     });
 
     evtSource.addEventListener("done", (ev) => {
