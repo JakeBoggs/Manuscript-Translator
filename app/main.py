@@ -167,6 +167,7 @@ TAG_RE_PAGE_BLOCK = re.compile(
     r"<page[_-]?(\d+)>\s*([\s\S]*?)\s*</page[_-]?\1>",
     re.IGNORECASE,
 )
+TAG_RE_PAGE_START = re.compile(r"<page[_-]?(\d+)>", re.IGNORECASE)
 
 
 def _openrouter_client() -> AsyncOpenAI:
@@ -267,30 +268,63 @@ async def _translate_batch(
     return (resp.choices[0].message.content or "").strip()
 
 
-def _extract_completed_page_blocks(
+def _pop_completed_page_blocks_incremental(
     buffer: str, *, total_pages: int, emitted: set[int]
 ) -> Tuple[Dict[int, str], str]:
     """
-    Finds any fully-closed <page_N>...</page_N> blocks in buffer that haven't been emitted yet.
-    Returns (new_blocks, trimmed_buffer).
+    Robust incremental extraction of <page_N>...</page_N> blocks.
+
+    - Maps strictly by the numeric N in the tag (NOT by output order).
+    - Avoids the "wrong page" issue when the model temporarily emits malformed/out-of-order tags while streaming.
     """
-    new: Dict[int, str] = {}
-    last_end = 0
-    for m in TAG_RE_PAGE_BLOCK.finditer(buffer or ""):
+    out: Dict[int, str] = {}
+    if not buffer:
+        return out, buffer
+
+    while True:
+        m = TAG_RE_PAGE_START.search(buffer)
+        if not m:
+            # Keep buffer bounded
+            if len(buffer) > 200_000:
+                buffer = buffer[-200_000:]
+            return out, buffer
+
+        start_idx = m.start()
+        tag_end = m.end()
         try:
             n = int(m.group(1))
         except Exception:
+            # Skip malformed tag
+            buffer = buffer[tag_end:]
             continue
-        if 1 <= n <= total_pages and n not in emitted:
-            new[n] = (m.group(2) or "").strip()
-            emitted.add(n)
-        if m.end() > last_end:
-            last_end = m.end()
 
-    # Trim buffer to keep tail (in case the model is still writing the next page)
-    if last_end > 0:
-        buffer = buffer[last_end:]
-    return new, buffer
+        end_tag = f"</page_{n}>"
+        end_tag_alt = f"</page-{n}>"
+
+        end_idx = buffer.lower().find(end_tag, tag_end)
+        end_len = len(end_tag)
+        if end_idx < 0:
+            end_idx = buffer.lower().find(end_tag_alt, tag_end)
+            end_len = len(end_tag_alt)
+
+        # If we can't find the matching end tag yet, but there is another page start after this one,
+        # assume this tag was malformed/unclosed and skip forward to the next start to avoid blocking.
+        if end_idx < 0:
+            next_start = TAG_RE_PAGE_START.search(buffer, tag_end)
+            if next_start:
+                buffer = buffer[next_start.start():]
+                continue
+            # Otherwise, wait for more chunks; keep from this start tag
+            buffer = buffer[start_idx:]
+            return out, buffer
+
+        content = buffer[tag_end:end_idx].strip()
+        if 1 <= n <= total_pages and n not in emitted:
+            out[n] = content
+            emitted.add(n)
+
+        # Consume through end tag and continue scanning
+        buffer = buffer[end_idx + end_len :]
 
 
 async def _translate_batch_stream(
@@ -323,12 +357,16 @@ async def _translate_batch_stream(
             continue
 
         buffer += chunk
-        new_blocks, buffer = _extract_completed_page_blocks(buffer, total_pages=total_pages, emitted=emitted)
+        new_blocks, buffer = _pop_completed_page_blocks_incremental(
+            buffer, total_pages=total_pages, emitted=emitted
+        )
         for page_number, translation_md in new_blocks.items():
             yield page_number, translation_md
 
     # Flush anything remaining (in case the final tag closed right at the end)
-    new_blocks, _ = _extract_completed_page_blocks(buffer, total_pages=total_pages, emitted=emitted)
+    new_blocks, _ = _pop_completed_page_blocks_incremental(
+        buffer, total_pages=total_pages, emitted=emitted
+    )
     for page_number, translation_md in new_blocks.items():
         yield page_number, translation_md
 
