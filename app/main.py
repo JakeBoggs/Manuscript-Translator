@@ -250,7 +250,7 @@ async def _transcribe_one(
         resp = await client.chat.completions.create(
             model=TRANSCRIBE_MODEL,
             messages=_transcribe_messages(image_url),
-            temperature=0.2
+            temperature=1.0
         )
         content = (resp.choices[0].message.content or "").strip()
         return content, content
