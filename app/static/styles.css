@@ -236,6 +236,31 @@ code {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  display: none; /* do not show image URLs */
+}
+
+.img-toggle {
+  margin-top: 10px;
+  display: inline-flex;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+  background: #ffffff;
+}
+
+.img-toggle-btn {
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  padding: 8px 10px;
+  cursor: pointer;
+  font-weight: 600;
+  font-size: 12px;
+}
+
+.img-toggle-btn.is-active {
+  color: var(--text);
+  background: #f1f5f9;
 }
 
 .img-wrap {

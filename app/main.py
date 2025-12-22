@@ -1,4 +1,8 @@
 import asyncio
+import base64
+import io
+import time
+import uuid
 import os
 import re
 import json
@@ -7,13 +11,16 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 from openai import AsyncOpenAI
 from pydantic import BaseModel, Field, HttpUrl
-from starlette.responses import StreamingResponse
+from starlette.responses import StreamingResponse, Response
+from PIL import Image
+import cv2
+import numpy as np
 
 
 load_dotenv()
@@ -26,6 +33,11 @@ MAX_CONCURRENCY = 20
 
 TRANSCRIBE_MODEL = "google/gemini-3-pro-preview"
 TRANSLATE_MODEL = "google/gemini-3-pro-preview"
+CROP_MODEL = "google/gemini-3-flash-preview"
+
+# In-memory cache for cropped images (job-scoped).
+_CROP_CACHE_TTL_S = 60 * 60
+_crop_cache: Dict[str, Dict[str, Any]] = {}
 
 
 app = FastAPI(title=FASTAPI_APP_TITLE)
@@ -47,6 +59,8 @@ class PageResult(BaseModel):
     page_number: int
     label: str
     image_url: str
+    original_image_url: str = ""
+    enhanced_image_url: str = ""
     transcript_md: str
     translation_md: str
     raw_model_output: str
@@ -180,6 +194,212 @@ def _openrouter_client() -> AsyncOpenAI:
     )
 
 
+def _cleanup_crop_cache() -> None:
+    now = time.time()
+    dead: List[str] = []
+    for job_id, blob in _crop_cache.items():
+        created = float(blob.get("created", 0))
+        if now - created > _CROP_CACHE_TTL_S:
+            dead.append(job_id)
+    for job_id in dead:
+        _crop_cache.pop(job_id, None)
+
+
+def _cache_cropped(job_id: str, page_number: int, img_bytes: bytes, media_type: str) -> None:
+    _crop_cache.setdefault(job_id, {"created": time.time(), "pages": {}})
+    _crop_cache[job_id]["pages"].setdefault(int(page_number), {})
+    _crop_cache[job_id]["pages"][int(page_number)]["enhanced"] = {"bytes": img_bytes, "media_type": media_type}
+
+
+def _get_cached_cropped(job_id: str, page_number: int) -> Optional[Dict[str, Any]]:
+    blob = _crop_cache.get(job_id)
+    if not blob:
+        return None
+    page = (blob.get("pages") or {}).get(int(page_number)) or {}
+    return page.get("enhanced")
+
+
+def _cache_original(job_id: str, page_number: int, img_bytes: bytes, media_type: str) -> None:
+    _crop_cache.setdefault(job_id, {"created": time.time(), "pages": {}})
+    _crop_cache[job_id]["pages"].setdefault(int(page_number), {})
+    _crop_cache[job_id]["pages"][int(page_number)]["original"] = {"bytes": img_bytes, "media_type": media_type}
+
+
+def _get_cached_original(job_id: str, page_number: int) -> Optional[Dict[str, Any]]:
+    blob = _crop_cache.get(job_id)
+    if not blob:
+        return None
+    page = (blob.get("pages") or {}).get(int(page_number)) or {}
+    return page.get("original")
+
+
+async def _fetch_image_bytes(url: str) -> Tuple[bytes, str]:
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_S, follow_redirects=True) as client:
+        r = await client.get(url, headers={"Accept": "image/*"})
+        r.raise_for_status()
+        media_type = r.headers.get("content-type", "image/jpeg").split(";")[0].strip() or "image/jpeg"
+        return r.content, media_type
+
+
+def _to_data_url(img_bytes: bytes, media_type: str) -> str:
+    b64 = base64.b64encode(img_bytes).decode("ascii")
+    return f"data:{media_type};base64,{b64}"
+
+
+def _parse_json_object(text: str) -> Dict[str, Any]:
+    s = (text or "").strip()
+    if not s:
+        raise ValueError("empty response")
+    try:
+        obj = json.loads(s)
+        if isinstance(obj, dict):
+            return obj
+    except Exception:
+        pass
+    start = s.find("{")
+    end = s.rfind("}")
+    if start >= 0 and end > start:
+        obj = json.loads(s[start : end + 1])
+        if isinstance(obj, dict):
+            return obj
+    raise ValueError("could not parse JSON object")
+
+
+def _clamp(n: int, lo: int, hi: int) -> int:
+    return max(lo, min(hi, int(n)))
+
+
+def _crop_with_box(img_bytes: bytes, box_2d: List[int], *, pad_px: int = 8) -> bytes:
+    """
+    box_2d: [ymin,xmin,ymax,xmax] normalized 0-1000.
+    Returns cropped JPEG bytes.
+    """
+    im = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+    w, h = im.size
+    if w <= 1 or h <= 1:
+        return img_bytes
+    if not isinstance(box_2d, list) or len(box_2d) != 4:
+        return img_bytes
+
+    y1n, x1n, y2n, x2n = [int(v) for v in box_2d]
+    x1 = int(x1n / 1000 * w)
+    y1 = int(y1n / 1000 * h)
+    x2 = int(x2n / 1000 * w)
+    y2 = int(y2n / 1000 * h)
+
+    x1 = _clamp(x1 - pad_px, 0, w - 1)
+    y1 = _clamp(y1 - pad_px, 0, h - 1)
+    x2 = _clamp(x2 + pad_px, x1 + 1, w)
+    y2 = _clamp(y2 + pad_px, y1 + 1, h)
+
+    crop = im.crop((x1, y1, x2, y2))
+    out = io.BytesIO()
+    crop.save(out, format="JPEG", quality=98, optimize=True)
+    return out.getvalue()
+
+
+def _apply_clahe_lab_l(jpeg_bytes: bytes) -> bytes:
+    """
+    Soft enhancement + CLAHE on the LAB L channel:
+    - Background normalization to reduce uneven illumination
+    - Soft ink/paper separation (Sauvola-like) blended to darken ink and slightly lift paper
+    Input/output are JPEG bytes.
+    """
+    arr = np.frombuffer(jpeg_bytes, dtype=np.uint8)
+    bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if bgr is None:
+        return jpeg_bytes
+
+    lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
+    l_chan, a_chan, b_chan = cv2.split(lab)
+
+    # 1) Background normalization (smooth illumination field) — keep gentle
+    l_f = l_chan.astype(np.float32)
+    bg = cv2.GaussianBlur(l_f, (0, 0), sigmaX=35.0)
+    bg = np.clip(bg, 1.0, 255.0)
+    ln = (l_f / bg) * 255.0
+    ln = np.clip(ln, 0.0, 255.0)
+
+    # 2) Sauvola-like local threshold => soft ink mask (0..1)
+    win = 45
+    mean = cv2.boxFilter(ln, ddepth=-1, ksize=(win, win), normalize=True)
+    mean2 = cv2.boxFilter(ln * ln, ddepth=-1, ksize=(win, win), normalize=True)
+    var = np.maximum(0.0, mean2 - mean * mean)
+    std = np.sqrt(var)
+    k = 0.12
+    R = 128.0
+    thresh = mean * (1.0 + k * (std / R - 1.0))
+
+    d = (thresh - ln)  # positive => likely ink
+    softness = 20.0
+    mask = 1.0 / (1.0 + np.exp(-d / softness))
+
+    # 3) Blend (soft enhancement)
+    ink_dark = 12.0
+    paper_lift = 2.0
+    out_l = ln - ink_dark * mask + paper_lift * (1.0 - mask)
+    # Blend back toward original L to keep the effect subtle.
+    alpha = 0.55
+    out_l = (1.0 - alpha) * l_f + alpha * out_l
+    out_l = np.clip(out_l, 0.0, 255.0).astype(np.uint8)
+
+    # 4) Very strong sharpening AFTER soft enhancement (luminance-only).
+    # Warning: this can introduce halos/noise; reduce weights/sigma if it looks too harsh.
+    out_f2 = out_l.astype(np.float32)
+    blur2 = cv2.GaussianBlur(out_f2, (0, 0), sigmaX=6.0)
+    out_sharp = cv2.addWeighted(out_f2, 1.55, blur2, -0.55, 0.0)
+    out_l = np.clip(out_sharp, 0.0, 255.0).astype(np.uint8)
+
+    # 5) Gentle CLAHE
+    clahe = cv2.createCLAHE(clipLimit=1.6, tileGridSize=(64, 64))
+    out_l = clahe.apply(out_l)
+
+    lab2 = cv2.merge((out_l, a_chan, b_chan))
+    bgr2 = cv2.cvtColor(lab2, cv2.COLOR_LAB2BGR)
+    ok, enc = cv2.imencode(".jpg", bgr2, [int(cv2.IMWRITE_JPEG_QUALITY), 98])
+    if not ok:
+        return jpeg_bytes
+    return enc.tobytes()
+
+
+def _crop_prompt() -> str:
+    return (
+        "Return ONE bounding box that tightly contains the main body text.\n"
+        "Ignore decorative margins, page borders, stains, and minor marginal notes if they are small compared to the main text.\n"
+        "Output MUST be valid JSON with exactly this shape:\n"
+        "{\"box_2d\":[ymin,xmin,ymax,xmax]}\n"
+        "Where box_2d values are integers normalized to 0-1000 in [ymin,xmin,ymax,xmax] order.\n"
+        "Do not include any other keys or any extra text."
+    )
+
+
+async def _detect_crop_box(
+    client: AsyncOpenAI, *, image_data_url: str, semaphore: asyncio.Semaphore
+) -> List[int]:
+    async with semaphore:
+        resp = await client.chat.completions.create(
+            model=CROP_MODEL,
+            messages=[
+                {"role": "system", "content": "You output strict JSON only."},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": _crop_prompt()},
+                        {"type": "image_url", "image_url": {"url": image_data_url}},
+                    ],
+                },
+            ],
+            temperature=0.2,
+            response_format={"type": "json_object"},
+        )
+        content = (resp.choices[0].message.content or "").strip()
+        obj = _parse_json_object(content)
+        box = obj.get("box_2d")
+        if not isinstance(box, list) or len(box) != 4:
+            raise ValueError(f"invalid box_2d: {box}")
+        return [int(v) for v in box]
+
+
 def _transcribe_messages(image_url: str) -> List[Dict[str, Any]]:
     system = (
         "Task: Transcribe the page faithfully.\n"
@@ -216,7 +436,8 @@ def _translate_batch_messages(tagged_transcripts: str, total_pages: int) -> List
         "Do not include any other text outside the <page_N> tags.\n"
         "If something is unclear, keep uncertainty in [brackets].\n"
         "OCR was used for the transcription and may have errors. Use context clues to correct them.\n"
-        "Translate as faithfully as possible and use [brackets] to provide modern context when needed."
+        "Translate as faithfully and use [brackets] to provide modern context when appropriate.\n"
+        "You should attempt to translate as much of the text as possible. Heavy annotation is desired when parts are unclear or missing."
     )
     user_text = (
         f"Translate all pages to English. There are {total_pages} pages.\n\n"
@@ -366,6 +587,24 @@ async def index() -> HTMLResponse:
     return HTMLResponse(html)
 
 
+@app.get("/api/crop/{job_id}/{page_number}")
+async def get_crop(job_id: str, page_number: int) -> Response:
+    _cleanup_crop_cache()
+    item = _get_cached_cropped(job_id, page_number)
+    if not item:
+        raise HTTPException(status_code=404, detail="Cropped image not ready")
+    return Response(content=item["bytes"], media_type=item["media_type"])
+
+
+@app.get("/api/original/{job_id}/{page_number}")
+async def get_original(job_id: str, page_number: int) -> Response:
+    _cleanup_crop_cache()
+    item = _get_cached_original(job_id, page_number)
+    if not item:
+        raise HTTPException(status_code=404, detail="Original image not ready")
+    return Response(content=item["bytes"], media_type=item["media_type"])
+
+
 def _sse_event(event: str, data: Any) -> bytes:
     payload = json.dumps(data, ensure_ascii=False)
     # Basic SSE format
@@ -402,14 +641,24 @@ async def stream(iiif_url: HttpUrl, request: Request) -> StreamingResponse:
             )
             return
 
-        # Send all images ASAP so frontend can render immediately
+        _cleanup_crop_cache()
+        job_id = uuid.uuid4().hex
+
+        # Send all raw images ASAP; we'll stream per-page updates with cropped image URLs as they become ready.
         manifest_payload = {
             "manifest_url": str(iiif_url),
             "total_pages": len(pages),
             "pages": [
-                {"page_number": i + 1, "label": label or f"Page {i+1}", "image_url": img}
+                {
+                    "page_number": i + 1,
+                    "label": label or f"Page {i+1}",
+                    "image_url": img,
+                    "original_image_url": img,
+                    "enhanced_image_url": "",
+                }
                 for i, (label, img) in enumerate(pages)
             ],
+            "job_id": job_id,
         }
         yield _sse_event("manifest", manifest_payload)
 
@@ -423,11 +672,31 @@ async def stream(iiif_url: HttpUrl, request: Request) -> StreamingResponse:
         completed = 0
 
         async def run_transcribe(i: int, label: str, image_url: str) -> PageResult:
-            transcript_md, raw = await _transcribe_one(client, image_url=image_url, semaphore=semaphore)
+            # Preprocess: crop to main body text (ignoring minor margins), then transcribe cropped image.
+            raw_bytes, raw_media = await _fetch_image_bytes(image_url)
+            raw_data_url = _to_data_url(raw_bytes, raw_media)
+
+            cropped_bytes: bytes = raw_bytes
+            try:
+                box = await _detect_crop_box(client, image_data_url=raw_data_url, semaphore=semaphore)
+                cropped_bytes = _crop_with_box(raw_bytes, box)
+            except Exception:
+                # If crop detection fails, fall back to full image.
+                cropped_bytes = raw_bytes
+
+            # Cache original + enhanced (CLAHE on cropped)
+            _cache_original(job_id, i + 1, raw_bytes, raw_media)
+            enhanced_bytes = _apply_clahe_lab_l(cropped_bytes)
+            _cache_cropped(job_id, i + 1, enhanced_bytes, "image/jpeg")
+            cropped_data_url = _to_data_url(enhanced_bytes, "image/jpeg")
+
+            transcript_md, raw = await _transcribe_one(client, image_url=cropped_data_url, semaphore=semaphore)
             return PageResult(
                 page_number=i + 1,
                 label=label or f"Page {i+1}",
-                image_url=image_url,
+                image_url=f"/api/crop/{job_id}/{i+1}",
+                original_image_url=f"/api/original/{job_id}/{i+1}",
+                enhanced_image_url=f"/api/crop/{job_id}/{i+1}",
                 transcript_md=transcript_md,
                 translation_md="",
                 raw_model_output=raw,
@@ -491,6 +760,8 @@ async def stream(iiif_url: HttpUrl, request: Request) -> StreamingResponse:
                         "page_number": p.page_number,
                         "label": p.label,
                         "image_url": p.image_url,
+                        "original_image_url": p.original_image_url,
+                        "enhanced_image_url": p.enhanced_image_url,
                         "transcript_md": p.transcript_md,
                         "translation_md": p.translation_md,
                         "raw_model_output": p.raw_model_output,

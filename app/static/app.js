@@ -16,6 +16,11 @@ let lastPages = [];
 let viewMode = "translation"; // default
 let evtSource = null;
 let streamDone = false;
+const imgModeByPage = new Map(); // page_number(string) -> "enhanced" | "original"
+
+function pageKey(n) {
+  return String(n ?? "");
+}
 
 marked.setOptions({
   gfm: true,
@@ -88,10 +93,36 @@ function renderPages(pages) {
   for (const p of pages) {
     const node = els.tpl.content.cloneNode(true);
     node.querySelector(".page-title").textContent = `Page ${p.page_number}: ${p.label || ""}`.trim();
-    node.querySelector(".page-subtitle").textContent = p.image_url;
+    // Intentionally do not show URLs.
+    node.querySelector(".page-subtitle").textContent = "";
     const img = node.querySelector(".page-img");
-    img.src = p.image_url;
+    const mode = imgModeByPage.get(pageKey(p.page_number)) || "enhanced";
+    const enhancedUrl = (p.enhanced_image_url || "").trim() || (p.image_url || "").trim();
+    const originalUrl = (p.original_image_url || "").trim();
+    const chosenUrl = mode === "original" && originalUrl ? originalUrl : enhancedUrl;
+    img.src = chosenUrl;
     img.alt = `Page ${p.page_number}`;
+
+    const enhBtn = node.querySelector('[data-img-mode="enhanced"]');
+    const origBtn = node.querySelector('[data-img-mode="original"]');
+    const setActive = (m) => {
+      if (m === "enhanced") {
+        enhBtn.classList.add("is-active");
+        origBtn.classList.remove("is-active");
+      } else {
+        enhBtn.classList.remove("is-active");
+        origBtn.classList.add("is-active");
+      }
+    };
+    setActive(mode);
+    enhBtn.addEventListener("click", () => {
+      imgModeByPage.set(pageKey(p.page_number), "enhanced");
+      renderPages(lastPages);
+    });
+    origBtn.addEventListener("click", () => {
+      imgModeByPage.set(pageKey(p.page_number), "original");
+      renderPages(lastPages);
+    });
 
     const content = viewMode === "translation" ? p.translation_md : p.transcript_md;
     node.querySelector(".content-inner").innerHTML = mdToHtml(content || "");
@@ -303,7 +334,9 @@ async function exportPdf() {
 
       let imageDataUrl = null;
       try {
-        const img = await fetchImageDataUrl(p.image_url);
+        // Use ORIGINAL image for PDF export.
+        const src = (p.original_image_url || "").trim() || (p.image_url || "").trim();
+        const img = await fetchImageDataUrl(src);
         imageDataUrl = img.dataUrl;
       } catch {
         imageDataUrl = null;
@@ -354,6 +387,7 @@ els.form.addEventListener("submit", async (e) => {
   updatePdfButtonState();
   els.results.innerHTML = "";
   lastPages = [];
+  imgModeByPage.clear();
 
   try {
     const streamUrl = `/api/stream?iiif_url=${encodeURIComponent(iiifUrl)}`;
