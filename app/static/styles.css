@@ -272,13 +272,18 @@ code {
   margin-top: 16px;
 }
 
-.content-inner pre {
-  padding: 10px;
-  overflow: auto;
-  border-radius: 10px;
-  background: #0b1220;
-  color: #e2e8f0;
-  border: 1px solid rgba(15, 23, 42, 0.14);
+/* We intentionally do NOT render code blocks; backend text sometimes includes them.
+   If any slip through, keep them visually neutral. */
+.content-inner pre,
+.content-inner code {
+  background: transparent;
+  border: none;
+  padding: 0;
+  color: inherit;
+  font-family: inherit;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .content-inner blockquote {

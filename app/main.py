@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from jinja2 import Environment, FileSystemLoader, select_autoescape
@@ -24,7 +24,7 @@ OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 REQUEST_TIMEOUT_S = 240.0
 MAX_CONCURRENCY = 20
 
-TRANSCRIBE_MODEL = "google/gemini-3-flash-preview"
+TRANSCRIBE_MODEL = "google/gemini-3-pro-preview"
 TRANSLATE_MODEL = "google/gemini-3-pro-preview"
 
 
@@ -182,15 +182,18 @@ def _openrouter_client() -> AsyncOpenAI:
 
 def _transcribe_messages(image_url: str) -> List[Dict[str, Any]]:
     system = (
-        "Task: Transcribe the page EXACTLY as seen.\n"
+        "Task: Transcribe the page faithfully.\n"
         "Output MUST be ONLY the transcription as Markdown.\n"
         "Do not add any preamble, commentary, or extra sections.\n"
-        "Preserve line breaks as best as possible.\n"
-        "If a character/word is illegible, keep position with [?] and continue.\n"
+        "Preserve formatting as best as possible.\n"
+        "For text that you can see but is ambiguous, make your best guesses like [guess 1/guess 2].\n"
+        "For text sections or words that are entirely illegible, use [illegible] as a placeholder and continue.\n"
         "Make inferences when appropriate, but put them in [brackets].\n"
+        "You should use context clues to help you, as many of the letters will be difficult to make out.\n"
+        "Your objective is to capture as much of the text as possible."
     )
     user_text = (
-        "Transcribe exactly."
+        "Transcribe this page."
     )
     return [
         {"role": "system", "content": system},
@@ -213,7 +216,7 @@ def _translate_batch_messages(tagged_transcripts: str, total_pages: int) -> List
         "Do not include any other text outside the <page_N> tags.\n"
         "If something is unclear, keep uncertainty in [brackets].\n"
         "OCR was used for the transcription and may have errors. Use context clues to correct them.\n"
-        "Translate as faithfully as possible and [brackets] to provide modern context when needed."
+        "Translate as faithfully as possible and use [brackets] to provide modern context when needed."
     )
     user_text = (
         f"Translate all pages to English. There are {total_pages} pages.\n\n"
@@ -225,24 +228,6 @@ def _translate_batch_messages(tagged_transcripts: str, total_pages: int) -> List
     ]
 
 
-def _parse_page_blocks(text: str, total_pages: int) -> Dict[int, str]:
-    """
-    Parses <page_1>...</page_1> blocks. Returns mapping of 1-based page_number -> content.
-    """
-    out: Dict[int, str] = {}
-    for m in TAG_RE_PAGE_BLOCK.finditer(text or ""):
-        try:
-            n = int(m.group(1))
-        except Exception:
-            continue
-        out[n] = (m.group(2) or "").strip()
-
-    # Fallback: if model didn't use tags and there's only one page, treat whole output as page_1
-    if not out and total_pages == 1 and (text or "").strip():
-        out[1] = (text or "").strip()
-    return out
-
-
 async def _transcribe_one(
     client: AsyncOpenAI, *, image_url: str, semaphore: asyncio.Semaphore
 ) -> Tuple[str, str]:
@@ -250,22 +235,11 @@ async def _transcribe_one(
         resp = await client.chat.completions.create(
             model=TRANSCRIBE_MODEL,
             messages=_transcribe_messages(image_url),
-            temperature=1.0
+            temperature=1.0,
+            extra_body={"reasoning": {"effort": "low"}},
         )
         content = (resp.choices[0].message.content or "").strip()
         return content, content
-
-
-async def _translate_batch(
-    client: AsyncOpenAI, *, tagged_transcripts: str, total_pages: int
-) -> str:
-    resp = await client.chat.completions.create(
-        model=TRANSLATE_MODEL,
-        messages=_translate_batch_messages(tagged_transcripts, total_pages),
-        temperature=1.0,
-        extra_body={"reasoning": {"effort": "high"}}
-    )
-    return (resp.choices[0].message.content or "").strip()
 
 
 def _pop_completed_page_blocks_incremental(
@@ -390,58 +364,6 @@ async def index() -> HTMLResponse:
     template = templates_env.get_template("index.html")
     html = template.render()
     return HTMLResponse(html)
-
-
-@app.post("/api/process", response_model=ProcessResponse)
-async def process(req: ProcessRequest) -> ProcessResponse:
-    try:
-        manifest = await _fetch_json(str(req.iiif_url))
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to fetch IIIF manifest: {e}")
-
-    pages = _parse_manifest(manifest)
-    if not pages:
-        raise HTTPException(
-            status_code=400,
-            detail="Could not find canvases/images in the manifest. Supported: IIIF Presentation v2 sequences[0].canvases or v3 items.",
-        )
-
-    try:
-        client = _openrouter_client()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-    semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
-
-    async def run_one(i: int, label: str, image_url: str) -> PageResult:
-        transcript_md, raw = await _transcribe_one(client, image_url=image_url, semaphore=semaphore)
-        return PageResult(
-            page_number=i + 1,
-            label=label or f"Page {i+1}",
-            image_url=image_url,
-            transcript_md=transcript_md,
-            translation_md="",
-            raw_model_output=raw,
-        )
-
-    tasks = [run_one(i, label, img) for i, (label, img) in enumerate(pages)]
-    results = await asyncio.gather(*tasks)
-
-    # Batch translate all transcripts in one request.
-    tagged = "\n\n".join(
-        f"<page_{p.page_number}>\n{p.transcript_md}\n</page_{p.page_number}>"
-        for p in results
-    )
-    batch_out = await _translate_batch(client, tagged_transcripts=tagged, total_pages=len(results))
-    translations = _parse_page_blocks(batch_out, total_pages=len(results))
-    for p in results:
-        p.translation_md = translations.get(p.page_number, "")
-
-    return ProcessResponse(
-        manifest_url=str(req.iiif_url),
-        total_pages=len(results),
-        pages=results,
-    )
 
 
 def _sse_event(event: str, data: Any) -> bytes:

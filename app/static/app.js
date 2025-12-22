@@ -24,6 +24,35 @@ marked.setOptions({
   mangle: false,
 });
 
+function escapeHtml(s) {
+  return String(s || "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;");
+}
+
+function stripCodeFromHtml(html) {
+  const doc = new DOMParser().parseFromString(html || "", "text/html");
+
+  // Replace fenced/indented code blocks with plain text (preserve line breaks).
+  doc.querySelectorAll("pre").forEach((pre) => {
+    const text = pre.textContent || "";
+    const div = doc.createElement("div");
+    div.className = "md-plain";
+    div.innerHTML = escapeHtml(text).replace(/\n/g, "<br>");
+    pre.replaceWith(div);
+  });
+
+  // Replace inline code with plain text.
+  doc.querySelectorAll("code").forEach((code) => {
+    const span = doc.createElement("span");
+    span.textContent = code.textContent || "";
+    code.replaceWith(span);
+  });
+
+  return doc.body.innerHTML;
+}
+
 function setStatus(text, kind = "info") {
   els.status.textContent = text || "";
   els.status.className = `status status-${kind}`;
@@ -45,10 +74,11 @@ function mdToHtml(md) {
   // Convert markdown -> HTML then sanitize. Do NOT HTML-escape first, or it breaks markdown syntax like '>' blockquotes.
   const html = marked.parse(md || "");
   if (typeof DOMPurify !== "undefined") {
-    return DOMPurify.sanitize(html, { USE_PROFILES: { html: true } });
+    const safe = DOMPurify.sanitize(html, { USE_PROFILES: { html: true } });
+    return stripCodeFromHtml(safe);
   }
   // Fallback (shouldn't happen since we load DOMPurify via CDN):
-  return html;
+  return stripCodeFromHtml(html);
 }
 
 function renderPages(pages) {
@@ -131,9 +161,10 @@ async function fetchImageDataUrl(url) {
 function mdToSafeHtml(md) {
   const html = marked.parse(md || "");
   if (typeof DOMPurify !== "undefined") {
-    return DOMPurify.sanitize(html, { USE_PROFILES: { html: true } });
+    const safe = DOMPurify.sanitize(html, { USE_PROFILES: { html: true } });
+    return stripCodeFromHtml(safe);
   }
-  return html;
+  return stripCodeFromHtml(html);
 }
 
 function createPdfPageElement({ pagePxW, pagePxH, p, imageDataUrl }) {
@@ -223,16 +254,7 @@ function createPdfPageElement({ pagePxW, pagePxH, p, imageDataUrl }) {
   c3.body.innerHTML = mdToSafeHtml(p.translation_md || "");
 
   // Make code blocks wrap
-  const styleCodeWrap = (root) => {
-    root.querySelectorAll("pre, code").forEach((n) => {
-      n.style.whiteSpace = "pre-wrap";
-      n.style.overflowWrap = "anywhere";
-      n.style.wordBreak = "break-word";
-      n.style.maxWidth = "100%";
-    });
-  };
-  styleCodeWrap(c2.body);
-  styleCodeWrap(c3.body);
+  // (No code blocks are rendered; they are stripped into plain text above.)
 
   el.appendChild(c1.col);
   el.appendChild(c2.col);
