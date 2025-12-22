@@ -21,7 +21,7 @@ load_dotenv()
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 FASTAPI_APP_TITLE = "Manuscript Translator"
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-REQUEST_TIMEOUT_S = 90.0
+REQUEST_TIMEOUT_S = 240.0
 MAX_CONCURRENCY = 20
 
 TRANSCRIBE_MODEL = "google/gemini-3-flash-preview"
@@ -167,21 +167,6 @@ TAG_RE_PAGE_BLOCK = re.compile(
 )
 
 
-def _extract_tagged_sections(text: str) -> Tuple[str, str]:
-    transcript = ""
-    translation = ""
-    mt = TAG_RE_TRANSCRIPT.search(text or "")
-    if mt:
-        transcript = mt.group(1).strip()
-    ml = TAG_RE_TRANSLATION.search(text or "")
-    if ml:
-        translation = ml.group(1).strip()
-    # Fallback: if tags are missing, treat the full output as translation.
-    if not transcript and not translation and (text or "").strip():
-        translation = (text or "").strip()
-    return transcript, translation
-
-
 def _openrouter_client() -> AsyncOpenAI:
     if not OPENROUTER_API_KEY:
         raise RuntimeError("Missing OPENROUTER_API_KEY")
@@ -221,10 +206,11 @@ def _translate_batch_messages(tagged_transcripts: str, total_pages: int) -> List
         "Task: Translate each page transcript to English.\n"
         "Input is a set of XML-like blocks: <page_1>...</page_1>, <page_2>...</page_2>, etc.\n"
         "Output MUST contain translations for EVERY page in the SAME format: <page_1>...</page_1> ...\n"
-        "Inside each <page_N> tag, return Markdown only.\n"
+        "Inside each <page_N> tag, use Markdown to format based on the author's intent (rather than matching OCR line for line).\n"
         "Do not include any other text outside the <page_N> tags.\n"
         "If something is unclear, keep uncertainty in [brackets].\n"
-        "OCR was used for the transcription and may have errors. Use context clues to correct them."
+        "OCR was used for the transcription and may have errors. Use context clues to correct them.\n"
+        "Translate as faithfully as possible and [brackets] to provide modern context when needed."
     )
     user_text = (
         f"Translate all pages to English. There are {total_pages} pages.\n\n"
