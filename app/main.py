@@ -83,7 +83,8 @@ def _iiif_label_to_text(label_obj: Any) -> str:
 def _image_url_from_service(service_id: str) -> str:
     # Standard IIIF Image API pattern
     service_id = service_id.rstrip("/")
-    return f"{service_id}/full/full/0/default.jpg"
+    # Prefer "max" sizing (commonly supported and avoids requesting unbounded "full" size).
+    return f"{service_id}/full/max/0/default.jpg"
 
 
 def _extract_canvases_v2(manifest: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -119,7 +120,7 @@ def _get_canvas_image_url(canvas: Dict[str, Any]) -> str:
         if direct:
             return direct
 
-    # v3: canvas.items[0].items[0].body.service[0].id or body.id
+    # v3: canvas.items[0].items[0].body.id (preferred) or body.service[0].id
     items = canvas.get("items")
     if isinstance(items, list) and items:
         anno_page = items[0] or {}
@@ -127,6 +128,10 @@ def _get_canvas_image_url(canvas: Dict[str, Any]) -> str:
         if isinstance(annos, list) and annos:
             anno = annos[0] or {}
             body = anno.get("body") or {}
+            # Prefer the concrete image URL if present (many manifests provide a good /full/max/ URL here).
+            direct = _first_present(body.get("id"), body.get("@id"))
+            if direct:
+                return direct
             service = body.get("service") or []
             if isinstance(service, dict):
                 service = [service]
@@ -135,9 +140,6 @@ def _get_canvas_image_url(canvas: Dict[str, Any]) -> str:
                 service_id = _first_present(s0.get("id"), s0.get("@id"))
                 if service_id:
                     return _image_url_from_service(service_id)
-            direct = _first_present(body.get("id"), body.get("@id"))
-            if direct:
-                return direct
 
     return ""
 
