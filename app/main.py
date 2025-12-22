@@ -35,6 +35,10 @@ TRANSCRIBE_MODEL = "google/gemini-3-flash-preview"
 TRANSLATE_MODEL = "openai/gpt-5.2"
 CROP_MODEL = "google/gemini-3-flash-preview"
 
+# Transcription self-consistency sampling
+TRANSCRIBE_N_SAMPLES = 5
+TRANSCRIBE_SAMPLE_TEMPERATURE = 1.0
+
 # In-memory cache for cropped images (job-scoped).
 _CROP_CACHE_TTL_S = 60 * 60
 _crop_cache: Dict[str, Dict[str, Any]] = {}
@@ -427,6 +431,36 @@ def _transcribe_messages(image_url: str) -> List[Dict[str, Any]]:
     ]
 
 
+def _final_transcribe_messages(image_url: str, drafts: List[str]) -> List[Dict[str, Any]]:
+    system = (
+        "You are an expert manuscript transcriptionist.\n"
+        "You will be given: (a) the page image, and (b) multiple draft transcriptions.\n"
+        "Task: Produce ONE final transcription that is as faithful as possible to the image.\n"
+        "Use the drafts only as hints; the IMAGE is the source of truth.\n"
+        "Output MUST be ONLY the final transcription as Markdown.\n"
+        "Do not add any preamble, commentary, or extra sections.\n"
+        "Preserve formatting as best as possible.\n"
+        "For text that is entirely illegible, use [illegible].\n"
+        "For ambiguous text, use best guesses like [guess 1/guess 2].\n"
+        "Use [brackets] for inferred expansions.\n"
+    )
+    joined = "\n\n".join([f"Draft {i+1}:\n{d.strip()}" for i, d in enumerate(drafts)])
+    user_text = (
+        "Here are multiple draft transcriptions. Please produce the single best final transcription.\n\n"
+        f"{joined}"
+    )
+    return [
+        {"role": "system", "content": system},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": user_text},
+                {"type": "image_url", "image_url": {"url": image_url}},
+            ],
+        },
+    ]
+
+
 def _translate_batch_messages(tagged_transcripts: str, total_pages: int) -> List[Dict[str, Any]]:
     system = (
         "Task: Translate each page transcript to English.\n"
@@ -451,17 +485,30 @@ def _translate_batch_messages(tagged_transcripts: str, total_pages: int) -> List
 
 
 async def _transcribe_one(
-    client: AsyncOpenAI, *, image_url: str, semaphore: asyncio.Semaphore
-) -> Tuple[str, str]:
+    client: AsyncOpenAI, *, image_url: str, semaphore: asyncio.Semaphore, temperature: float = 1.0
+) -> str:
     async with semaphore:
         resp = await client.chat.completions.create(
             model=TRANSCRIBE_MODEL,
             messages=_transcribe_messages(image_url),
-            temperature=1.0,
+            temperature=temperature,
             extra_body={"reasoning": {"effort": "low"}},
         )
         content = (resp.choices[0].message.content or "").strip()
-        return content, content
+        return content
+
+
+async def _finalize_transcription(
+    client: AsyncOpenAI, *, image_url: str, drafts: List[str], semaphore: asyncio.Semaphore
+) -> str:
+    async with semaphore:
+        resp = await client.chat.completions.create(
+            model=TRANSCRIBE_MODEL,
+            messages=_final_transcribe_messages(image_url, drafts),
+            temperature=1.0,
+            extra_body={"reasoning": {"effort": "high"}},
+        )
+        return (resp.choices[0].message.content or "").strip()
 
 
 def _pop_completed_page_blocks_incremental(
@@ -534,6 +581,7 @@ async def _translate_batch_stream(
         model=TRANSLATE_MODEL,
         messages=_translate_batch_messages(tagged_transcripts, total_pages),
         stream=True,
+        extra_body={"reasoning": {"effort": "high"}},
     )
 
     buffer = ""
@@ -708,9 +756,24 @@ async def stream(iiif_url: HttpUrl, request: Request) -> StreamingResponse:
             }
 
         async def run_transcribe(pre: Dict[str, Any]) -> PageResult:
-            transcript_md, raw = await _transcribe_one(
-                client, image_url=str(pre["enhanced_data_url"]), semaphore=semaphore
+            img_data_url = str(pre["enhanced_data_url"])
+
+            # Sample draft transcripts in parallel, then ask the model to produce one final transcript.
+            drafts = await asyncio.gather(
+                *[
+                    _transcribe_one(
+                        client,
+                        image_url=img_data_url,
+                        semaphore=semaphore,
+                        temperature=TRANSCRIBE_SAMPLE_TEMPERATURE,
+                    )
+                    for _ in range(TRANSCRIBE_N_SAMPLES)
+                ]
             )
+            transcript_md = await _finalize_transcription(
+                client, image_url=img_data_url, drafts=list(drafts), semaphore=semaphore
+            )
+            raw = transcript_md
             return PageResult(
                 page_number=int(pre["page_number"]),
                 label=str(pre["label"]),
