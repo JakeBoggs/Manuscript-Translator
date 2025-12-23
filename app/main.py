@@ -34,7 +34,7 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 FASTAPI_APP_TITLE = "Manuscript Translator"
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 REQUEST_TIMEOUT_S = 240.0
-MAX_CONCURRENCY = 6
+MAX_CONCURRENCY = 4
 
 TRANSCRIBE_MODEL = "google/gemini-3-flash-preview"
 TRANSLATE_MODEL = "openai/gpt-5.2"
@@ -504,12 +504,17 @@ def _translate_batch_messages(tagged_transcripts: str, total_pages: int) -> List
 
 
 async def _transcribe_one(
-    client: AsyncOpenAI, *, image_url: str, semaphore: asyncio.Semaphore, temperature: float = 1.0
+    client: AsyncOpenAI,
+    *,
+    image_url: str,
+    semaphore: asyncio.Semaphore,
+    temperature: float = 1.0,
+    messages: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
     async with semaphore:
         resp = await client.chat.completions.create(
             model=TRANSCRIBE_MODEL,
-            messages=_transcribe_messages(image_url),
+            messages=messages if messages is not None else _transcribe_messages(image_url),
             temperature=temperature,
             extra_body={"reasoning": {"effort": "low"}},
         )
@@ -777,6 +782,9 @@ async def stream(iiif_url: HttpUrl, request: Request) -> StreamingResponse:
         async def run_transcribe(pre: Dict[str, Any]) -> PageResult:
             img_data_url = str(pre["enhanced_data_url"])
 
+            # Build the transcription messages ONCE per page, and reuse the same object for all draft samples.
+            shared_transcribe_messages = _transcribe_messages(img_data_url)
+
             # Sample draft transcripts in parallel, then ask the model to produce one final transcript.
             drafts = await asyncio.gather(
                 *[
@@ -785,6 +793,7 @@ async def stream(iiif_url: HttpUrl, request: Request) -> StreamingResponse:
                         image_url=img_data_url,
                         semaphore=semaphore,
                         temperature=TRANSCRIBE_SAMPLE_TEMPERATURE,
+                        messages=shared_transcribe_messages,
                     )
                     for _ in range(TRANSCRIBE_N_SAMPLES)
                 ]
