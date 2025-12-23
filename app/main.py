@@ -44,6 +44,9 @@ CROP_MODEL = "google/gemini-3-flash-preview"
 TRANSCRIBE_N_SAMPLES = 5
 TRANSCRIBE_SAMPLE_TEMPERATURE = 1.0
 
+# Resize incoming page images to keep memory/CPU bounded (preserve aspect ratio).
+LOAD_MAX_DIM = 4500
+
 # In-memory cache for cropped images (job-scoped).
 _CROP_CACHE_TTL_S = 60 * 60
 _crop_cache: Dict[str, Dict[str, Any]] = {}
@@ -242,7 +245,13 @@ def _cache_original(job_id: str, page_number: int, img_bytes: bytes, media_type:
     _crop_cache.setdefault(job_id, {"created": time.time(), "pages": {}, "dir": str(_JOB_DIR / job_id)})
     job_dir = Path(_crop_cache[job_id]["dir"])
     job_dir.mkdir(parents=True, exist_ok=True)
-    out_path = job_dir / f"{int(page_number):05d}_original.jpg"
+    ext = ".bin"
+    mt = (media_type or "").lower()
+    if "jpeg" in mt or "jpg" in mt:
+        ext = ".jpg"
+    elif "png" in mt:
+        ext = ".png"
+    out_path = job_dir / f"{int(page_number):05d}_original{ext}"
     out_path.write_bytes(img_bytes)
     _crop_cache[job_id]["pages"].setdefault(int(page_number), {})
     _crop_cache[job_id]["pages"][int(page_number)]["original"] = {"path": str(out_path), "media_type": media_type}
@@ -267,6 +276,26 @@ async def _fetch_image_bytes(url: str) -> Tuple[bytes, str]:
 def _to_data_url(img_bytes: bytes, media_type: str) -> str:
     b64 = base64.b64encode(img_bytes).decode("ascii")
     return f"data:{media_type};base64,{b64}"
+
+
+def _resize_image_max_dim(img_bytes: bytes, media_type: str, *, max_dim: int) -> Tuple[bytes, str]:
+    """
+    If the image's max(width,height) > max_dim, resize (preserving aspect ratio).
+    Returns (bytes, media_type). If resizing occurs, output is JPEG for compatibility/size.
+    """
+    im = Image.open(io.BytesIO(img_bytes))
+    w, h = im.size
+    if max(w, h) <= int(max_dim):
+        return img_bytes, media_type
+
+    scale = float(max_dim) / float(max(w, h))
+    new_w = max(1, int(w * scale))
+    new_h = max(1, int(h * scale))
+
+    im = im.convert("RGB").resize((new_w, new_h), Image.Resampling.LANCZOS)
+    out = io.BytesIO()
+    im.save(out, format="JPEG", quality=98, optimize=True)
+    return out.getvalue(), "image/jpeg"
 
 
 def _parse_json_object(text: str) -> Dict[str, Any]:
@@ -752,6 +781,9 @@ async def stream(iiif_url: HttpUrl, request: Request) -> StreamingResponse:
             # Preprocess ASAP: crop to main body text (ignoring minor margins), enhance, cache both,
             # and return endpoints + a data URL for the model.
             raw_bytes, raw_media = await _fetch_image_bytes(image_url)
+            raw_bytes, raw_media = await asyncio.to_thread(
+                _resize_image_max_dim, raw_bytes, raw_media, max_dim=LOAD_MAX_DIM
+            )
             raw_data_url = _to_data_url(raw_bytes, raw_media)
 
             cropped_bytes: bytes = raw_bytes
