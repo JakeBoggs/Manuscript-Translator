@@ -1,6 +1,8 @@
 import asyncio
 import base64
 import io
+import shutil
+import tempfile
 import time
 import uuid
 import os
@@ -18,7 +20,7 @@ from fastapi.staticfiles import StaticFiles
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 from openai import AsyncOpenAI
 from pydantic import BaseModel, Field, HttpUrl
-from starlette.responses import StreamingResponse, Response
+from starlette.responses import StreamingResponse, Response, FileResponse
 from PIL import Image
 import cv2
 import numpy as np
@@ -32,7 +34,7 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 FASTAPI_APP_TITLE = "Manuscript Translator"
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 REQUEST_TIMEOUT_S = 240.0
-MAX_CONCURRENCY = 20
+MAX_CONCURRENCY = 6
 
 TRANSCRIBE_MODEL = "google/gemini-3-flash-preview"
 TRANSLATE_MODEL = "openai/gpt-5.2"
@@ -45,6 +47,9 @@ TRANSCRIBE_SAMPLE_TEMPERATURE = 1.0
 # In-memory cache for cropped images (job-scoped).
 _CROP_CACHE_TTL_S = 60 * 60
 _crop_cache: Dict[str, Dict[str, Any]] = {}
+
+_JOB_DIR = Path(tempfile.gettempdir()) / "manuscript_translator_jobs"
+_JOB_DIR.mkdir(parents=True, exist_ok=True)
 
 
 app = FastAPI(title=FASTAPI_APP_TITLE)
@@ -209,13 +214,20 @@ def _cleanup_crop_cache() -> None:
         if now - created > _CROP_CACHE_TTL_S:
             dead.append(job_id)
     for job_id in dead:
+        job_dir = _crop_cache.get(job_id, {}).get("dir")
+        if job_dir:
+            shutil.rmtree(job_dir, ignore_errors=True)
         _crop_cache.pop(job_id, None)
 
 
 def _cache_cropped(job_id: str, page_number: int, img_bytes: bytes, media_type: str) -> None:
-    _crop_cache.setdefault(job_id, {"created": time.time(), "pages": {}})
+    _crop_cache.setdefault(job_id, {"created": time.time(), "pages": {}, "dir": str(_JOB_DIR / job_id)})
+    job_dir = Path(_crop_cache[job_id]["dir"])
+    job_dir.mkdir(parents=True, exist_ok=True)
+    out_path = job_dir / f"{int(page_number):05d}_enhanced.jpg"
+    out_path.write_bytes(img_bytes)
     _crop_cache[job_id]["pages"].setdefault(int(page_number), {})
-    _crop_cache[job_id]["pages"][int(page_number)]["enhanced"] = {"bytes": img_bytes, "media_type": media_type}
+    _crop_cache[job_id]["pages"][int(page_number)]["enhanced"] = {"path": str(out_path), "media_type": media_type}
 
 
 def _get_cached_cropped(job_id: str, page_number: int) -> Optional[Dict[str, Any]]:
@@ -227,9 +239,13 @@ def _get_cached_cropped(job_id: str, page_number: int) -> Optional[Dict[str, Any
 
 
 def _cache_original(job_id: str, page_number: int, img_bytes: bytes, media_type: str) -> None:
-    _crop_cache.setdefault(job_id, {"created": time.time(), "pages": {}})
+    _crop_cache.setdefault(job_id, {"created": time.time(), "pages": {}, "dir": str(_JOB_DIR / job_id)})
+    job_dir = Path(_crop_cache[job_id]["dir"])
+    job_dir.mkdir(parents=True, exist_ok=True)
+    out_path = job_dir / f"{int(page_number):05d}_original.jpg"
+    out_path.write_bytes(img_bytes)
     _crop_cache[job_id]["pages"].setdefault(int(page_number), {})
-    _crop_cache[job_id]["pages"][int(page_number)]["original"] = {"bytes": img_bytes, "media_type": media_type}
+    _crop_cache[job_id]["pages"][int(page_number)]["original"] = {"path": str(out_path), "media_type": media_type}
 
 
 def _get_cached_original(job_id: str, page_number: int) -> Optional[Dict[str, Any]]:
@@ -643,7 +659,7 @@ async def get_crop(job_id: str, page_number: int) -> Response:
     item = _get_cached_cropped(job_id, page_number)
     if not item:
         raise HTTPException(status_code=404, detail="Cropped image not ready")
-    return Response(content=item["bytes"], media_type=item["media_type"])
+    return FileResponse(path=item["path"], media_type=item["media_type"])
 
 
 @app.get("/api/original/{job_id}/{page_number}")
@@ -652,7 +668,7 @@ async def get_original(job_id: str, page_number: int) -> Response:
     item = _get_cached_original(job_id, page_number)
     if not item:
         raise HTTPException(status_code=404, detail="Original image not ready")
-    return Response(content=item["bytes"], media_type=item["media_type"])
+    return FileResponse(path=item["path"], media_type=item["media_type"])
 
 
 def _sse_event(event: str, data: Any) -> bytes:
@@ -736,14 +752,14 @@ async def stream(iiif_url: HttpUrl, request: Request) -> StreamingResponse:
             cropped_bytes: bytes = raw_bytes
             try:
                 box = await _detect_crop_box(client, image_data_url=raw_data_url, semaphore=semaphore)
-                cropped_bytes = _crop_with_box(raw_bytes, box)
+                cropped_bytes = await asyncio.to_thread(_crop_with_box, raw_bytes, box)
             except Exception:
                 # If crop detection fails, fall back to full image.
                 cropped_bytes = raw_bytes
 
             # Cache original + enhanced
             _cache_original(job_id, i + 1, raw_bytes, raw_media)
-            enhanced_bytes = _apply_clahe_lab_l(cropped_bytes)
+            enhanced_bytes = await asyncio.to_thread(_apply_clahe_lab_l, cropped_bytes)
             _cache_cropped(job_id, i + 1, enhanced_bytes, "image/jpeg")
             enhanced_data_url = _to_data_url(enhanced_bytes, "image/jpeg")
 
