@@ -35,10 +35,7 @@ A web application that transcribes and translates historical manuscripts using G
 
 ## Usage
 
-1. Find a IIIF manifest URL from a library or archive. Examples:
-   - [Bodleian Libraries](https://digital.bodleian.ox.ac.uk/)
-   - [British Library](https://www.bl.uk/manuscripts/)
-   - [Gallica (BnF)](https://gallica.bnf.fr/)
+1. Find a IIIF manifest URL from a library or archive.
 
 2. Paste the manifest URL into the input field and click **Process**.
 
