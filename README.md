@@ -1,32 +1,54 @@
-## Manuscript Translator
+# Manuscript Translator
 
-Single-page web app: paste a **IIIF manifest URL**, the server extracts the **first sequence/items** canvases, pulls each canvas image, then (in parallel) asks the model to:
+A web application that transcribes and translates historical manuscripts using Gemini 3. Simply provide a IIIF manifest URL, and the app will automatically extract pages, enhance images, transcribe the text, and translate it to English.
 
-- **Transcribe exactly** (markdown) inside `<transcript>...</transcript>`
-- **Translate to English** (markdown) inside `<translation>...</translation>`
+## Features
 
-The UI shows the **image on the left** and **transcript/translation on the right** with a toggle (default: translation).
+- **IIIF Support** — Works with IIIF Presentation API v2 and v3 manifests from libraries, archives, and museums worldwide
+- **Intelligent Cropping** — Automatically detects and crops the main text area, ignoring margins and decorative elements
+- **Image Enhancement** — Applies CLAHE-based contrast enhancement and sharpening to improve legibility of faded manuscripts
+- **AI Translation** — Translates transcribed text to English with contextual annotations
+- **Real-time Streaming** — Results stream to the browser as they complete via Server-Sent Events
+- **PDF Export** — Save the complete manuscript with images, transcriptions, and translations side-by-side as a PDF
 
-### Streaming behavior (SSE)
+## Quick Start
 
-The UI uses **Server-Sent Events**:
+### Running with Docker
 
-- The server sends a `manifest` event immediately with **all page image URLs** (so images render right away).
-- Then it sends `page` events as each page finishes.
-- Finally it sends `done`.
+1. Clone the repository:
+   ```bash
+   git clone https://github.com/yourusername/Manuscript-Translator.git
+   cd Manuscript-Translator
+   ```
 
-### Run with Docker
+2. Create a `.env` file with your OpenRouter API key:
+   ```bash
+   echo "OPENROUTER_API_KEY=your_api_key_here" > .env
+   ```
 
-1) Start:
+3. Start the application:
+   ```bash
+   docker-compose up --build
+   ```
 
-```
-docker compose up --build
-```
+4. Open [http://localhost:8000](http://localhost:8000) in your browser.
 
-2) Open:
+## Usage
 
-- `http://localhost:8000`
+1. Find a IIIF manifest URL from a library or archive. Examples:
+   - [Bodleian Libraries](https://digital.bodleian.ox.ac.uk/)
+   - [British Library](https://www.bl.uk/manuscripts/)
+   - [Gallica (BnF)](https://gallica.bnf.fr/)
 
-### Environment variables
+2. Paste the manifest URL into the input field and click **Process**.
 
-- **OPENROUTER_API_KEY**: required
+3. Watch as pages are processed in real-time:
+   - Images are fetched and enhanced
+   - Transcriptions appear as they complete
+   - Translations stream in progressively
+
+4. Toggle between **Translation** and **Transcript** views using the buttons in the header.
+
+5. Toggle between **Enhanced** and **Original** images for each page.
+
+6. Click **Save PDF** to export the complete document.
