@@ -37,7 +37,8 @@ A web application that transcribes and translates historical manuscripts using G
 
 ## Usage
 
-1. Find a IIIF manifest URL from a library or archive.
+1. Find a IIIF manifest URL from a library or archive. For example:
+    - https://iiif.archive.org/iiif/images_SutroCollectionMS04_12/manifest.json
 
 2. Paste the manifest URL into the input field and click **Process**.
 
