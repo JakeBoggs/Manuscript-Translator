@@ -2,7 +2,7 @@
 
 A web application that transcribes and translates historical manuscripts using Gemini 3. Simply provide a IIIF manifest URL, and the app will automatically extract pages, enhance images, transcribe the text, and translate it to English.
 
-<img width="1896" height="913" alt="image" src="https://github.com/user-attachments/assets/20a5dfdf-80d2-4096-be45-5b68c06ac110" />
+<img width="1897" height="911" alt="Example screenshot" src="https://github.com/user-attachments/assets/44d18185-77b5-4713-8c2e-8260203aced6" />
 
 ## Features
 
